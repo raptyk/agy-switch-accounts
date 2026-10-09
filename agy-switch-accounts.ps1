@@ -186,20 +186,180 @@ function global:AgyAcc-AssertNotRunning([switch]$Force) {
     return $false
 }
 
+# agy may leave processes behind for a few seconds after --print returns; they could still write a refreshed
+# token into Credential Manager, so wait for them before swapping the credential.
+function global:AgyAcc-WaitForExit([int]$TimeoutSec = 60) {
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while (Get-Process agy -ErrorAction SilentlyContinue) {
+        if ((Get-Date) -gt $deadline) { return $false }
+        Start-Sleep -Milliseconds 500
+    }
+    return $true
+}
+
+# Sends one prompt from each profile, so every account's usage window (5h limit) starts now.
+# Restores the originally active account afterwards (also on Ctrl+C).
+function global:AgyAcc-Warmup([string[]]$Names, [string]$Message, [string]$Model, [switch]$Force) {
+    $original = AgyAcc-SyncActive
+    if ($original -and $original.Email -and -not (AgyAcc-GetProfiles | Where-Object Email -eq $original.Email) -and -not $Force) {
+        Write-Host "The active session $($original.Email) is not saved. Save it first: agy-acc save <name>  (or use -Force)." -ForegroundColor Yellow
+        return $false
+    }
+
+    $agyArgs = @('--print', $Message, '--print-timeout', '180s', '--disable-slash-commands')
+    if ($Model) { $agyArgs += @('--model', $Model) }
+    # Neutral, empty working directory - agy treats the current directory as its workspace.
+    $workDir = Join-Path ([IO.Path]::GetTempPath()) 'agy-acc-warmup'
+    New-Item -ItemType Directory -Path $workDir -Force | Out-Null
+
+    Write-Host "`n[$((Get-Date).ToString('HH:mm:ss'))] Warming up $($Names.Count) profile(s) with '$Message':" -ForegroundColor Cyan
+    Push-Location $workDir
+    try {
+        foreach ($name in $Names) {
+            $target = AgyAcc-LoadProfile $name
+            Write-Host ("  {0,-16} {1,-32} " -f $name, $target.Email) -NoNewline
+            if (-not $target) { Write-Host "profile not found, skipped" -ForegroundColor Yellow; continue }
+            if (-not (AgyAcc-WaitForExit)) { Write-Host "agy still running, skipped" -ForegroundColor Yellow; continue }
+
+            [AgyAcc.WinCred]::Write($AgyAccTarget, $target.User, $target.Blob)
+            $out = (& agy @agyArgs 2>&1 | Out-String).Trim()
+            $code = $LASTEXITCODE
+            AgyAcc-WaitForExit | Out-Null
+            AgyAcc-SyncActive | Out-Null   # keep the token agy may have refreshed
+
+            $first = ($out -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 1)
+            if ($first -and $first.Length -gt 70) { $first = $first.Substring(0, 70) + '...' }
+            if ($code -eq 0) { Write-Host "OK  $first" -ForegroundColor Green }
+            else { Write-Host "FAILED (exit $code)  $first" -ForegroundColor Red }
+        }
+    } finally {
+        Pop-Location
+        AgyAcc-WaitForExit | Out-Null
+        # Restore the original account - from its profile, since its token may have been refreshed meanwhile.
+        $saved = if ($original -and $original.Email) { AgyAcc-GetProfiles | Where-Object Email -eq $original.Email | Select-Object -First 1 }
+        if ($saved) {
+            $restore = AgyAcc-LoadProfile $saved.Name
+            [AgyAcc.WinCred]::Write($AgyAccTarget, $restore.User, $restore.Blob)
+        } elseif ($original) {
+            [AgyAcc.WinCred]::Write($AgyAccTarget, $original.User, $original.Blob)
+        } else {
+            [AgyAcc.WinCred]::Delete($AgyAccTarget) | Out-Null
+        }
+        Write-Host "  Restored active session: $(if ($original) { $original.Email } else { '(none)' })" -ForegroundColor DarkGray
+    }
+    return $true
+}
+
+# Step-by-step guide for adding an account, with a hint based on the current state.
+function global:AgyAcc-ShowAddAccountGuide {
+    $profiles = @(AgyAcc-GetProfiles)
+    $active = AgyAcc-ReadActive
+    $activeProfile = if ($active -and $active.Email) { $profiles | Where-Object Email -eq $active.Email | Select-Object -First 1 }
+
+    # One box of the flow chart: the command to type on the left, what to do in plain words on the right.
+    $step = {
+        param([string]$Num, [string]$Cmd, [string[]]$Notes, [switch]$Last)
+        $n = @($Notes) + @('', '')
+        Write-Host "   +-------------------------+"
+        Write-Host "   | $Num. " -NoNewline
+        Write-Host $Cmd -NoNewline -ForegroundColor Green
+        Write-Host ("{0}|   {1}" -f (' ' * (21 - $Cmd.Length)), $n[0])
+        if ($Last) {
+            Write-Host ("   +-------------------------+   $($n[1])".TrimEnd())
+            if ($n[2]) { Write-Host "                                 $($n[2])" }
+            return
+        }
+        Write-Host ("   +------------+------------+   $($n[1])".TrimEnd())
+        Write-Host ("                |                $($n[2])".TrimEnd())
+        Write-Host "                v"
+    }
+
+    Write-Host "`nHow to add another Google account" -ForegroundColor Cyan
+    Write-Host "=================================" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  It takes about a minute: you type 3 commands and sign in once in the browser."
+    Write-Host ""
+    & $step 1 'agy-acc new' @(
+        'Type this to make room for the new account.',
+        "Don't worry - your saved accounts stay safe,",
+        "nothing gets logged out on Google's side.")
+    & $step 2 'agy' @(
+        'Start agy. It opens the browser - now YOU sign in',
+        'there with the NEW Google account. Once agy says',
+        "you're in, just close agy as you normally do.")
+    & $step 3 'agy-acc save work' @(
+        'Give the account a short name you will remember,',
+        'e.g. "work", "private", "john". You will use this',
+        'name later to switch to this account.')
+    & $step 4 'agy-acc list' @(
+        'Check that it worked: your new name is on the list',
+        'with a * next to it (that is the account in use now).') -Last
+    Write-Host ""
+    Write-Host "  Done! Want to add more accounts? Just repeat steps 1-4."
+    Write-Host "  To jump between accounts later, type: " -NoNewline
+    Write-Host "agy-acc switch <name>" -ForegroundColor Green
+    Write-Host ""
+    Write-Host "  One rule: don't use /logout inside agy - it can break your saved accounts." -ForegroundColor DarkYellow
+    Write-Host "  'agy-acc new' (step 1) is the safe way to make room for another account." -ForegroundColor DarkYellow
+    Write-Host ""
+
+    Write-Host "Where are you now? " -NoNewline -ForegroundColor Yellow
+    if (-not $active) {
+        Write-Host "agy isn't signed in to any account yet - skip step 1 and start with step 2."
+    } elseif (-not $activeProfile) {
+        Write-Host "You're signed in as $($active.Email), but this account isn't saved yet."
+        Write-Host "  Save it first so you don't lose it: " -NoNewline
+        Write-Host "agy-acc save <name>" -NoNewline -ForegroundColor Green
+        Write-Host " - then start with step 1."
+    } else {
+        Write-Host "You're signed in as $($active.Email) (saved as '$($activeProfile.Name)'), so start with step 1."
+    }
+    Write-Host ""
+}
+
 function global:agy-acc {
     param (
         [Parameter(Position = 0)]
-        [ValidateSet('switch', 'use', 'save', 'list', 'current', 'new', 'remove', 'help')]
-        [string]$Action = 'list',
+        [ValidateSet('switch', 'use', 'save', 'list', 'current', 'new', 'remove', 'warmup', 'help', 'help-addaccount')]
+        [string]$Action = 'help',
 
         [Parameter(Position = 1)]
         [ValidatePattern('^[\w.@-]+$')]
         [string]$Name,
 
+        # warmup: prompt to send, model to use, repeat interval in hours (0 = run once).
+        [string]$Message = 'hello',
+        [string]$Model,
+        [ValidateRange(0, 168)]
+        [double]$Every = 0,
+
         [switch]$Force
     )
 
     switch ($Action) {
+        'warmup' {
+            $names = if ($Name) { @($Name) } else { @(AgyAcc-GetProfiles | ForEach-Object Name) }
+            if (-not $names) {
+                Write-Host "No saved profiles. Save one first: agy-acc save <name>" -ForegroundColor Yellow
+                return
+            }
+            if ($Every -eq 0 -and -not (AgyAcc-AssertNotRunning -Force:$Force)) { return }
+
+            while ($true) {
+                if ($Every -gt 0 -and (Get-Process agy -ErrorAction SilentlyContinue)) {
+                    Write-Host "agy is running - waiting for it to exit before warming up (Ctrl+C to stop)..." -ForegroundColor Yellow
+                    while (Get-Process agy -ErrorAction SilentlyContinue) { Start-Sleep -Seconds 30 }
+                }
+                if (-not (AgyAcc-Warmup $names $Message $Model -Force:$Force)) { return }
+                if ($Every -eq 0) { return }
+
+                $next = (Get-Date).AddHours($Every)
+                Write-Host "Next round at $($next.ToString('yyyy-MM-dd HH:mm')) (Ctrl+C to stop)." -ForegroundColor Cyan
+                # Short sleeps against the wall clock, so the schedule survives the PC going to sleep.
+                while ((Get-Date) -lt $next) { Start-Sleep -Seconds 30 }
+            }
+        }
+
         'save' {
             if (-not $Name) {
                 Write-Host "Specify a profile name, e.g.: agy-acc save account1" -ForegroundColor Yellow
@@ -279,7 +439,7 @@ function global:agy-acc {
             $profiles = @(AgyAcc-GetProfiles)
             $active = AgyAcc-ReadActive
             if (-not $profiles) {
-                Write-Host "No saved profiles. Save the current one: agy-acc save <name>" -ForegroundColor Yellow
+                Write-Host "No saved profiles. Save the current one: agy-acc save <name>  (guide: agy-acc help-addaccount)" -ForegroundColor Yellow
             } else {
                 Write-Host "`nSaved Antigravity CLI profiles:" -ForegroundColor Cyan
                 foreach ($p in $profiles) {
@@ -293,7 +453,31 @@ function global:agy-acc {
             Write-Host ""
         }
 
+        'help-addaccount' { AgyAcc-ShowAddAccountGuide }
+
         default {
+            # With no profiles yet, adding the first account is what the user needs most.
+            if (-not @(AgyAcc-GetProfiles)) {
+                AgyAcc-ShowAddAccountGuide
+                Write-Host "------------------------------------------------------------------------" -ForegroundColor DarkGray
+            }
+            Write-Host "`nagy-acc - switch Google accounts in Antigravity CLI (agy) without signing in again" -ForegroundColor Cyan
+            Write-Host ""
+            Write-Host "How it works:" -ForegroundColor Yellow
+            Write-Host "  agy keeps its session (access/refresh token) in Windows Credential Manager as '$AgyAccTarget'."
+            Write-Host "  'save' copies that credential into a profile, 'switch' writes a saved copy back."
+            Write-Host "  Before every swap the active session is synced into its profile, because agy refreshes tokens."
+            Write-Host ""
+            Write-Host "Where data is stored:" -ForegroundColor Yellow
+            Write-Host "  $AgyAccStoreDir\<name>\credential.dpapi  - the session, DPAPI-encrypted (only this Windows user can read it)"
+            Write-Host "  $AgyAccStoreDir\<name>\profile.json      - email, auth method, last save time"
+            Write-Host ""
+            Write-Host "Install / update:" -ForegroundColor Yellow
+            Write-Host "  .\agy-switch-accounts.ps1 -Install  - adds a line to `$PROFILE that loads this script in every new terminal"
+            Write-Host "  `$PROFILE points at the script file, so new terminals always get the current version - no reinstall needed."
+            Write-Host "  To reload in an already open terminal: . `$PROFILE"
+            Write-Host "  Windows PowerShell 5.1 and PowerShell 7 have separate `$PROFILE files - run -Install in each one you use."
+            Write-Host ""
             Write-Host "Usage:" -ForegroundColor Yellow
             Write-Host "  agy-acc save <name>      - save the currently signed-in agy account as a profile"
             Write-Host "  agy-acc switch <name>    - switch agy to a saved profile (alias: use)"
@@ -301,9 +485,17 @@ function global:agy-acc {
             Write-Host "  agy-acc current          - show the active account"
             Write-Host "  agy-acc new              - sign out locally to add another account"
             Write-Host "  agy-acc remove <name>    - remove a saved profile"
+            Write-Host "  agy-acc help-addaccount  - step-by-step guide for adding an account" -ForegroundColor Green
+            Write-Host "  agy-acc warmup [<name>]  - send 'hello' from every profile (or one) to start its 5h usage window"
+            Write-Host "      -Message <text>      - prompt to send (default: hello)"
+            Write-Host "      -Model <model>       - model to use (see: agy models)"
+            Write-Host "      -Every <hours>       - keep running and repeat every N hours, e.g. -Every 5"
             Write-Host "  -Force                   - skip safety checks (running agy, unsaved session)"
             Write-Host ""
             Write-Host "Don't use /logout inside agy for saved accounts - it may revoke the refresh token on Google's side." -ForegroundColor DarkYellow
+            Write-Host "To add another account, run 'agy-acc new' instead: it only clears the local session, so saved tokens stay valid." -ForegroundColor DarkYellow
+            Write-Host "Then start agy, sign in with the new account in the browser, exit agy and run: agy-acc save <name>" -ForegroundColor DarkYellow
+            Write-Host ""
         }
     }
 }
