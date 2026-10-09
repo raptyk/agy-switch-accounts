@@ -52,7 +52,7 @@ To add another account, run `agy-acc new` instead: it only clears the local sess
 Usage limits run in 5-hour windows that start with the first message. `warmup` switches through the saved profiles one by one, sends a short prompt from each (`agy --print`), and then restores the account that was active before. That way every account's window starts now, not when you first need it.
 
 ```powershell
-agy-acc warmup                     # every profile, once
+agy-acc warmup                     # all profiles, one by one, once
 agy-acc warmup account1            # a single profile
 agy-acc warmup -Model "Gemini 3.1 Pro (Low)"   # start the window for a specific model
 agy-acc warmup -Every 5            # keep running: repeat every 5 hours (Ctrl+C to stop)

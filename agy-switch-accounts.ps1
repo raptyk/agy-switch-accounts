@@ -486,7 +486,8 @@ function global:agy-acc {
             Write-Host "  agy-acc new              - sign out locally to add another account"
             Write-Host "  agy-acc remove <name>    - remove a saved profile"
             Write-Host "  agy-acc help-addaccount  - step-by-step guide for adding an account" -ForegroundColor Green
-            Write-Host "  agy-acc warmup [<name>]  - send 'hello' from every profile (or one) to start its 5h usage window"
+            Write-Host "  agy-acc warmup           - send 'hello' from ALL profiles, one by one, to start their 5h usage windows"
+            Write-Host "  agy-acc warmup <name>    - the same, but only for one profile"
             Write-Host "      -Message <text>      - prompt to send (default: hello)"
             Write-Host "      -Model <model>       - model to use (see: agy models)"
             Write-Host "      -Every <hours>       - keep running and repeat every N hours, e.g. -Every 5"
