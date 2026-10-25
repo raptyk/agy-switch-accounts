@@ -54,7 +54,7 @@ Usage limits run in 5-hour windows that start with the first message. `warmup` s
 ```powershell
 agy-acc warmup                     # all profiles, one by one, once
 agy-acc warmup account1            # a single profile
-agy-acc warmup -Model "Gemini 3.1 Pro (Low)"   # start the window for a specific model
+agy-acc warmup -Model claude-sonnet-4-6   # start the window for a specific model (default: gemini-3.8-flash-low)
 agy-acc warmup -Every 5            # keep running: repeat every 5 hours (Ctrl+C to stop)
 agy-acc warmup -Message "hi"       # a different prompt
 ```

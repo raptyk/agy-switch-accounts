@@ -188,11 +188,11 @@ function global:AgyAcc-AssertNotRunning([switch]$Force) {
 
 # agy may leave processes behind for a few seconds after --print returns; they could still write a refreshed
 # token into Credential Manager, so wait for them before swapping the credential.
-function global:AgyAcc-WaitForExit([int]$TimeoutSec = 60) {
+function global:AgyAcc-WaitForExit([int]$TimeoutSec = 15) {
     $deadline = (Get-Date).AddSeconds($TimeoutSec)
     while (Get-Process agy -ErrorAction SilentlyContinue) {
         if ((Get-Date) -gt $deadline) { return $false }
-        Start-Sleep -Milliseconds 500
+        Start-Sleep -Milliseconds 100
     }
     return $true
 }
@@ -206,35 +206,68 @@ function global:AgyAcc-Warmup([string[]]$Names, [string]$Message, [string]$Model
         return $false
     }
 
-    $agyArgs = @('--print', $Message, '--print-timeout', '180s', '--disable-slash-commands')
+    # Low reasoning effort - the answer itself doesn't matter, only that a message was sent.
+    $agyArgs = @('--print', $Message, '--print-timeout', '15s', '--effort', 'low', '--disable-slash-commands')
     if ($Model) { $agyArgs += @('--model', $Model) }
     # Neutral, empty working directory - agy treats the current directory as its workspace.
     $workDir = Join-Path ([IO.Path]::GetTempPath()) 'agy-acc-warmup'
     New-Item -ItemType Directory -Path $workDir -Force | Out-Null
 
-    Write-Host "`n[$((Get-Date).ToString('HH:mm:ss'))] Warming up $($Names.Count) profile(s) with '$Message':" -ForegroundColor Cyan
+    # Progress log: every step gets a timestamp, so it is clear what the warmup is doing and how long it takes.
+    $log = { param([string]$Text, [string]$Color = 'Gray') Write-Host "[$((Get-Date).ToString('HH:mm:ss'))] $Text" -ForegroundColor $Color }
+    # Waits for leftover agy processes and logs it, but only when there is something to wait for.
+    $waitForAgy = {
+        param([string]$Reason)
+        if (-not (Get-Process agy -ErrorAction SilentlyContinue)) { return $true }
+        & $log "      waiting for agy to exit ($Reason)..." DarkGray
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $exited = AgyAcc-WaitForExit
+        if ($exited) { & $log ("      agy exited after {0:N1}s" -f $sw.Elapsed.TotalSeconds) DarkGray }
+        else { & $log "      agy still running after 15s" Yellow }
+        return $exited
+    }
+
+    $total = [Diagnostics.Stopwatch]::StartNew()
+    $ok = 0; $failed = 0; $skipped = 0
+    Write-Host ""
+    & $log "Warming up $($Names.Count) profile(s) with '$Message' (model: $(if ($Model) { $Model } else { 'agy default' }), timeout: 15s)" Cyan
     Push-Location $workDir
     try {
+        $i = 0
         foreach ($name in $Names) {
+            $i++
             $target = AgyAcc-LoadProfile $name
-            Write-Host ("  {0,-16} {1,-32} " -f $name, $target.Email) -NoNewline
-            if (-not $target) { Write-Host "profile not found, skipped" -ForegroundColor Yellow; continue }
-            if (-not (AgyAcc-WaitForExit)) { Write-Host "agy still running, skipped" -ForegroundColor Yellow; continue }
+            if (-not $target) { & $log "[$i/$($Names.Count)] $name - profile not found, skipped" Yellow; $skipped++; continue }
+            & $log "[$i/$($Names.Count)] $name  $($target.Email)" White
+            if (-not (& $waitForAgy 'before switching')) { & $log "      skipped" Yellow; $skipped++; continue }
 
             [AgyAcc.WinCred]::Write($AgyAccTarget, $target.User, $target.Blob)
-            $out = (& agy @agyArgs 2>&1 | Out-String).Trim()
-            $code = $LASTEXITCODE
-            AgyAcc-WaitForExit | Out-Null
-            AgyAcc-SyncActive | Out-Null   # keep the token agy may have refreshed
+            & $log "      switched credential, sending prompt..." DarkGray
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            # agy writes UTF-8, but PowerShell decodes native output with the console code page (e.g. 852),
+            # which garbles non-ASCII characters - decode it as UTF-8 for the duration of the call.
+            $consoleEncoding = [Console]::OutputEncoding
+            try {
+                [Console]::OutputEncoding = [Text.Encoding]::UTF8
+                $out = (& agy @agyArgs 2>&1 | Out-String).Trim()
+                $code = $LASTEXITCODE
+            } finally {
+                [Console]::OutputEncoding = $consoleEncoding
+            }
+            $elapsed = $sw.Elapsed.TotalSeconds
 
             $first = ($out -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 1)
             if ($first -and $first.Length -gt 70) { $first = $first.Substring(0, 70) + '...' }
-            if ($code -eq 0) { Write-Host "OK  $first" -ForegroundColor Green }
-            else { Write-Host "FAILED (exit $code)  $first" -ForegroundColor Red }
+            if ($code -eq 0) { & $log ("      OK in {0:N1}s: {1}" -f $elapsed, $first) Green; $ok++ }
+            else { & $log ("      FAILED (exit {0}) after {1:N1}s: {2}" -f $code, $elapsed, $first) Red; $failed++ }
+
+            & $waitForAgy 'it may still save a refreshed token' | Out-Null
+            AgyAcc-SyncActive | Out-Null   # keep the token agy may have refreshed
+            & $log "      token synced to profile '$name'" DarkGray
         }
     } finally {
         Pop-Location
-        AgyAcc-WaitForExit | Out-Null
+        & $waitForAgy 'before restoring' | Out-Null
         # Restore the original account - from its profile, since its token may have been refreshed meanwhile.
         $saved = if ($original -and $original.Email) { AgyAcc-GetProfiles | Where-Object Email -eq $original.Email | Select-Object -First 1 }
         if ($saved) {
@@ -245,7 +278,8 @@ function global:AgyAcc-Warmup([string[]]$Names, [string]$Message, [string]$Model
         } else {
             [AgyAcc.WinCred]::Delete($AgyAccTarget) | Out-Null
         }
-        Write-Host "  Restored active session: $(if ($original) { $original.Email } else { '(none)' })" -ForegroundColor DarkGray
+        & $log "Restored active session: $(if ($original) { $original.Email } else { '(none)' })" DarkGray
+        & $log ("Done in {0:N1}s: {1} OK, {2} failed, {3} skipped" -f $total.Elapsed.TotalSeconds, $ok, $failed, $skipped) Cyan
     }
     return $true
 }
@@ -329,7 +363,7 @@ function global:agy-acc {
 
         # warmup: prompt to send, model to use, repeat interval in hours (0 = run once).
         [string]$Message = 'hello',
-        [string]$Model,
+        [string]$Model = 'gemini-3.8-flash-low',
         [ValidateRange(0, 168)]
         [double]$Every = 0,
 
@@ -347,16 +381,17 @@ function global:agy-acc {
 
             while ($true) {
                 if ($Every -gt 0 -and (Get-Process agy -ErrorAction SilentlyContinue)) {
-                    Write-Host "agy is running - waiting for it to exit before warming up (Ctrl+C to stop)..." -ForegroundColor Yellow
-                    while (Get-Process agy -ErrorAction SilentlyContinue) { Start-Sleep -Seconds 30 }
+                    Write-Host "[$((Get-Date).ToString('HH:mm:ss'))] agy is running - waiting for it to exit before warming up, checking every 10s (Ctrl+C to stop)..." -ForegroundColor Yellow
+                    while (Get-Process agy -ErrorAction SilentlyContinue) { Start-Sleep -Seconds 10 }
+                    Write-Host "[$((Get-Date).ToString('HH:mm:ss'))] agy closed, starting the round." -ForegroundColor Yellow
                 }
                 if (-not (AgyAcc-Warmup $names $Message $Model -Force:$Force)) { return }
                 if ($Every -eq 0) { return }
 
                 $next = (Get-Date).AddHours($Every)
-                Write-Host "Next round at $($next.ToString('yyyy-MM-dd HH:mm')) (Ctrl+C to stop)." -ForegroundColor Cyan
+                Write-Host "[$((Get-Date).ToString('HH:mm:ss'))] Next round at $($next.ToString('yyyy-MM-dd HH:mm')) (Ctrl+C to stop)." -ForegroundColor Cyan
                 # Short sleeps against the wall clock, so the schedule survives the PC going to sleep.
-                while ((Get-Date) -lt $next) { Start-Sleep -Seconds 30 }
+                while ((Get-Date) -lt $next) { Start-Sleep -Seconds 10 }
             }
         }
 
@@ -489,7 +524,7 @@ function global:agy-acc {
             Write-Host "  agy-acc warmup           - send 'hello' from ALL profiles, one by one, to start their 5h usage windows"
             Write-Host "  agy-acc warmup <name>    - the same, but only for one profile"
             Write-Host "      -Message <text>      - prompt to send (default: hello)"
-            Write-Host "      -Model <model>       - model to use (see: agy models)"
+            Write-Host "      -Model <model>       - model to use (default: gemini-3.8-flash-low, see: agy models)"
             Write-Host "      -Every <hours>       - keep running and repeat every N hours, e.g. -Every 5"
             Write-Host "  -Force                   - skip safety checks (running agy, unsaved session)"
             Write-Host ""
